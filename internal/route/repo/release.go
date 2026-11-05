@@ -310,6 +310,34 @@ func UploadReleaseAttachment(c *context.Context) {
 	uploadAttachment(c, conf.Release.Attachment.AllowedTypes)
 }
 
+// CheckReleaseDuplicateAttachments returns original attachment names that are
+// used by two or more attachments of the requested release, along with the
+// attachment IDs of each group. It reads attachment metadata only, the
+// attachment contents are never read and no attachment is modified or
+// deleted. Read access to the repository is enforced by the route
+// middleware, and draft releases follow the same access rules as published
+// releases.
+func CheckReleaseDuplicateAttachments(c *context.Context) {
+	tagName := c.Params("*")
+	rel, err := database.GetRelease(c.Repo.Repository.ID, tagName)
+	if err != nil {
+		c.NotFoundOrError(err, "get release")
+		return
+	}
+
+	duplicates, err := database.GetDuplicateAttachmentsByReleaseID(rel.ID)
+	if err != nil {
+		c.Error(err, "get duplicate attachments by release ID")
+		return
+	}
+
+	c.JSONSuccess(map[string]any{
+		"tag_name":   rel.TagName,
+		"is_draft":   rel.IsDraft,
+		"duplicates": duplicates,
+	})
+}
+
 func DeleteRelease(c *context.Context) {
 	if err := database.DeleteReleaseOfRepoByID(c.Repo.Repository.ID, c.QueryInt64("id")); err != nil {
 		c.Flash.Error("DeleteReleaseByID: " + err.Error())

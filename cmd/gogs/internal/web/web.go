@@ -489,6 +489,11 @@ func Run(configPath string, portOverride int) error {
 				m.Get("/pulls/:index", repo.ViewPull)
 			}, context.RepoRef())
 
+			// Registered outside of RepoRef because draft releases have no tag
+			// in the Git repository yet, and drafts follow the same read
+			// access rules as published releases.
+			m.Get("/releases/attachments/duplicates/*", repo.MustBeNotBare, repo.CheckReleaseDuplicateAttachments)
+
 			m.Group("/branches", func() {
 				m.Get("", repo.Branches)
 				m.Get("/all", repo.AllBranches)

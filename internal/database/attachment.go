@@ -6,6 +6,7 @@ import (
 	"mime/multipart"
 	"os"
 	"path"
+	"sort"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -154,6 +155,61 @@ func getAttachmentsByReleaseID(e Engine, releaseID int64) ([]*Attachment, error)
 // GetAttachmentsByReleaseID returns all attachments of a release.
 func GetAttachmentsByReleaseID(releaseID int64) ([]*Attachment, error) {
 	return getAttachmentsByReleaseID(x, releaseID)
+}
+
+// DuplicateAttachment represents a group of release attachments that share
+// the same original name.
+type DuplicateAttachment struct {
+	Name          string  `json:"name"`
+	AttachmentIDs []int64 `json:"attachment_ids"`
+}
+
+// duplicateAttachments groups attachments by their original name and keeps
+// groups that contain at least two attachments. The grouping is case
+// sensitive, and attachments whose name is empty are grouped separately.
+// The result is sorted by name, and the IDs within each group are sorted in
+// ascending order.
+func duplicateAttachments(attachments []*Attachment) []DuplicateAttachment {
+	groups := make(map[string][]int64, len(attachments))
+	for _, attach := range attachments {
+		groups[attach.Name] = append(groups[attach.Name], attach.ID)
+	}
+
+	duplicates := make([]DuplicateAttachment, 0, len(groups))
+	for name, ids := range groups {
+		if len(ids) < 2 {
+			continue
+		}
+		sort.SliceStable(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		duplicates = append(duplicates, DuplicateAttachment{
+			Name:          name,
+			AttachmentIDs: ids,
+		})
+	}
+	sort.SliceStable(duplicates, func(i, j int) bool {
+		return duplicates[i].Name < duplicates[j].Name
+	})
+	return duplicates
+}
+
+func getDuplicateAttachmentsByReleaseID(e Engine, releaseID int64) ([]DuplicateAttachment, error) {
+	// Only the metadata columns needed for the comparison are queried.
+	// Attachment contents are stored on disk and are never read.
+	attachments := make([]*Attachment, 0, 10)
+	if err := e.Where("release_id = ?", releaseID).
+		Cols("id", "name").
+		Find(&attachments); err != nil {
+		return nil, err
+	}
+	return duplicateAttachments(attachments), nil
+}
+
+// GetDuplicateAttachmentsByReleaseID returns original names that are used by
+// two or more attachments of the release, along with the attachment IDs of
+// each group. It reads attachment metadata only and never modifies or
+// deletes attachments.
+func GetDuplicateAttachmentsByReleaseID(releaseID int64) ([]DuplicateAttachment, error) {
+	return getDuplicateAttachmentsByReleaseID(x, releaseID)
 }
 
 // DeleteAttachment deletes the given attachment and optionally the associated file.
