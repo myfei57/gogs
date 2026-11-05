@@ -198,6 +198,7 @@ type Repository struct {
 	// see docs in https://gorm.io/docs/migration.html.
 	IsUnlisted bool `xorm:"NOT NULL DEFAULT false" gorm:"not null;default:FALSE"`
 	IsBare     bool
+	IsArchived bool `xorm:"NOT NULL DEFAULT false" gorm:"not null;default:FALSE"`
 
 	IsMirror bool
 	*Mirror  `xorm:"-" gorm:"-" json:"-"`
@@ -226,6 +227,11 @@ type Repository struct {
 	CreatedUnix int64
 	Updated     time.Time `xorm:"-" gorm:"-" json:"-"`
 	UpdatedUnix int64
+
+	// MetadataVersion is monotonically increasing whenever the name,
+	// visibility, default branch or archive status is committed. It is the
+	// version carried by repository metadata invalidation events.
+	MetadataVersion int64 `xorm:"NOT NULL DEFAULT 0" gorm:"not null;default:0"`
 }
 
 func (r *Repository) BeforeInsert() {
@@ -1056,12 +1062,12 @@ func prepareRepoCommit(repo *Repository, tmpDir, repoPath string, opts CreateRep
 }
 
 // initRepository performs initial commit with chosen setup files on behave of doer.
-func initRepository(e Engine, repoPath string, doer *User, repo *Repository, opts CreateRepoOptionsLegacy) (err error) {
+func initRepository(e Engine, repoPath string, doer *User, repo *Repository, opts CreateRepoOptionsLegacy) (metadataEvents []RepoMetadataInvalidationEvent, err error) {
 	// Init bare new repository.
 	if err = git.Init(repoPath, git.InitOptions{Bare: true}); err != nil {
-		return errors.Newf("init repository: %v", err)
+		return nil, errors.Newf("init repository: %v", err)
 	} else if err = createDelegateHooks(repoPath); err != nil {
-		return errors.Newf("createDelegateHooks: %v", err)
+		return nil, errors.Newf("createDelegateHooks: %v", err)
 	}
 
 	// Set default branch
@@ -1073,7 +1079,7 @@ func initRepository(e Engine, repoPath string, doer *User, repo *Repository, opt
 		},
 	)
 	if err != nil {
-		return errors.Wrap(err, "set default branch")
+		return nil, errors.Wrap(err, "set default branch")
 	}
 
 	tmpDir := filepath.Join(os.TempDir(), "gogs-"+repo.Name+"-"+strconv.Itoa(time.Now().Nanosecond()))
@@ -1081,12 +1087,12 @@ func initRepository(e Engine, repoPath string, doer *User, repo *Repository, opt
 	// Initialize repository according to user's choice.
 	if opts.AutoInit {
 		if err = os.MkdirAll(tmpDir, os.ModePerm); err != nil {
-			return err
+			return nil, err
 		}
 		defer RemoveAllWithNotice("Delete repository for auto-initialization", tmpDir)
 
 		if err = prepareRepoCommit(repo, tmpDir, repoPath, opts); err != nil {
-			return errors.Newf("prepareRepoCommit: %v", err)
+			return nil, errors.Newf("prepareRepoCommit: %v", err)
 		}
 
 		// Apply changes and commit.
@@ -1099,14 +1105,14 @@ func initRepository(e Engine, repoPath string, doer *User, repo *Repository, opt
 			},
 		)
 		if err != nil {
-			return errors.Newf("initRepoCommit: %v", err)
+			return nil, errors.Newf("initRepoCommit: %v", err)
 		}
 	}
 
 	// Re-fetch the repository from database before updating it (else it would
 	// override changes that were done earlier with sql)
 	if repo, err = getRepositoryByID(e, repo.ID); err != nil {
-		return errors.Newf("getRepositoryByID: %v", err)
+		return nil, errors.Newf("getRepositoryByID: %v", err)
 	}
 
 	if !opts.AutoInit {
@@ -1114,11 +1120,11 @@ func initRepository(e Engine, repoPath string, doer *User, repo *Repository, opt
 	}
 
 	repo.DefaultBranch = conf.Repository.DefaultBranch
-	if err = updateRepository(e, repo, false); err != nil {
-		return errors.Newf("updateRepository: %v", err)
+	if metadataEvents, err = updateRepository(e, repo, false); err != nil {
+		return nil, errors.Newf("updateRepository: %v", err)
 	}
 
-	return nil
+	return metadataEvents, nil
 }
 
 var (
@@ -1251,8 +1257,10 @@ func CreateRepository(doer, owner *User, opts CreateRepoOptionsLegacy) (_ *Repos
 	}
 
 	// No need for init mirror.
+	var metadataEvents []RepoMetadataInvalidationEvent
 	if !opts.IsMirror {
-		if err = initRepository(sess, repoPath, doer, repo, opts); err != nil {
+		metadataEvents, err = initRepository(sess, repoPath, doer, repo, opts)
+		if err != nil {
 			RemoveAllWithNotice("Delete repository for initialization failure", repoPath)
 			return nil, errors.Newf("initRepository: %v", err)
 		}
@@ -1267,6 +1275,8 @@ func CreateRepository(doer, owner *User, opts CreateRepoOptionsLegacy) (_ *Repos
 	if err = sess.Commit(); err != nil {
 		return nil, err
 	}
+
+	publishRepoMetadataInvalidation(metadataEvents...)
 
 	// Remember visibility preference
 	err = Handle.Users().Update(context.TODO(), owner.ID, UpdateUserOptions{LastRepoVisibility: &repo.IsPrivate})
@@ -1572,7 +1582,49 @@ func GetNonMirrorRepositories() ([]*Repository, error) {
 	return getNonMirrorRepositories(x)
 }
 
-func updateRepository(e Engine, repo *Repository, visibilityChanged bool) (err error) {
+// bumpRepoMetadataVersion compares tracked repository metadata (name,
+// visibility, default branch and archive status) against the committed state
+// and advances the metadata version when at least one of them changed. It
+// returns the invalidation event to publish after the surrounding transaction
+// commits, or nil when no tracked field changed.
+func bumpRepoMetadataVersion(e Engine, repo *Repository) (*RepoMetadataInvalidationEvent, error) {
+	before := new(Repository)
+	has, err := e.ID(repo.ID).Get(before)
+	if err != nil {
+		return nil, errors.Newf("get repository [%d]: %v", repo.ID, err)
+	} else if !has {
+		return nil, ErrRepoNotExist{args: errx.Args{"repoID": repo.ID}}
+	}
+
+	var fields RepoMetadataField
+	if before.LowerName != repo.LowerName {
+		fields |= RepoMetadataFieldName
+	}
+	if before.IsPrivate != repo.IsPrivate || before.IsUnlisted != repo.IsUnlisted {
+		fields |= RepoMetadataFieldVisibility
+	}
+	if before.DefaultBranch != repo.DefaultBranch {
+		fields |= RepoMetadataFieldDefaultBranch
+	}
+	if before.IsArchived != repo.IsArchived {
+		fields |= RepoMetadataFieldArchiveStatus
+	}
+
+	// Never regress the version when the update does not touch tracked fields.
+	repo.MetadataVersion = before.MetadataVersion
+	if fields == 0 {
+		return nil, nil
+	}
+
+	repo.MetadataVersion = before.MetadataVersion + 1
+	return &RepoMetadataInvalidationEvent{
+		RepoID:  repo.ID,
+		Version: repo.MetadataVersion,
+		Fields:  fields,
+	}, nil
+}
+
+func updateRepository(e Engine, repo *Repository, visibilityChanged bool) (_ []RepoMetadataInvalidationEvent, err error) {
 	repo.LowerName = strings.ToLower(repo.Name)
 
 	if len(repo.Description) > 512 {
@@ -1582,18 +1634,28 @@ func updateRepository(e Engine, repo *Repository, visibilityChanged bool) (err e
 		repo.Website = repo.Website[:255]
 	}
 
+	metadataEvent, err := bumpRepoMetadataVersion(e, repo)
+	if err != nil {
+		return nil, err
+	}
+
+	var metadataEvents []RepoMetadataInvalidationEvent
+	if metadataEvent != nil {
+		metadataEvents = append(metadataEvents, *metadataEvent)
+	}
+
 	if _, err = e.ID(repo.ID).AllCols().Update(repo); err != nil {
-		return errors.Newf("update: %v", err)
+		return nil, errors.Newf("update: %v", err)
 	}
 
 	if visibilityChanged {
 		if err = repo.getOwner(e); err != nil {
-			return errors.Newf("getOwner: %v", err)
+			return nil, errors.Newf("getOwner: %v", err)
 		}
 		if repo.Owner.IsOrganization() {
 			// Organization repository need to recalculate access table when visibility is changed
 			if err = repo.recalculateTeamAccesses(e, 0); err != nil {
-				return errors.Newf("recalculateTeamAccesses: %v", err)
+				return nil, errors.Newf("recalculateTeamAccesses: %v", err)
 			}
 		}
 
@@ -1613,23 +1675,25 @@ func updateRepository(e Engine, repo *Repository, visibilityChanged bool) (err e
 
 		forkRepos, err := getRepositoriesByForkID(e, repo.ID)
 		if err != nil {
-			return errors.Newf("getRepositoriesByForkID: %v", err)
+			return nil, errors.Newf("getRepositoriesByForkID: %v", err)
 		}
 		for i := range forkRepos {
 			forkRepos[i].IsPrivate = repo.IsPrivate
 			forkRepos[i].IsUnlisted = repo.IsUnlisted
-			if err = updateRepository(e, forkRepos[i], true); err != nil {
-				return errors.Newf("updateRepository[%d]: %v", forkRepos[i].ID, err)
+			forkEvents, err := updateRepository(e, forkRepos[i], true)
+			if err != nil {
+				return nil, errors.Newf("updateRepository[%d]: %v", forkRepos[i].ID, err)
 			}
+			metadataEvents = append(metadataEvents, forkEvents...)
 		}
 
 		// Change visibility of generated actions
 		if _, err = e.Where("repo_id = ?", repo.ID).Cols("is_private").Update(&Action{IsPrivate: repo.IsPrivate || repo.IsUnlisted}); err != nil {
-			return errors.Newf("change action visibility of repository: %v", err)
+			return nil, errors.Newf("change action visibility of repository: %v", err)
 		}
 	}
 
-	return nil
+	return metadataEvents, nil
 }
 
 func UpdateRepository(repo *Repository, visibilityChanged bool) (err error) {
@@ -1639,11 +1703,19 @@ func UpdateRepository(repo *Repository, visibilityChanged bool) (err error) {
 		return err
 	}
 
-	if err = updateRepository(x, repo, visibilityChanged); err != nil {
+	metadataEvents, err := updateRepository(sess, repo, visibilityChanged)
+	if err != nil {
 		return errors.Newf("updateRepository: %v", err)
 	}
 
-	return sess.Commit()
+	if err = sess.Commit(); err != nil {
+		return errors.Newf("commit: %v", err)
+	}
+
+	// Publish only after the change is durable, a rolled back transaction must
+	// not invalidate live caches.
+	publishRepoMetadataInvalidation(metadataEvents...)
+	return nil
 }
 
 // DeleteRepository deletes a repository for a user or organization.
