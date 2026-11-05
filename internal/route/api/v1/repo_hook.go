@@ -27,6 +27,19 @@ func listHooks(c *context.APIContext) {
 	c.JSONSuccess(&apiHooks)
 }
 
+// hookStatusSummary returns counts of repository webhooks grouped by enabled
+// state and last delivery status. The response intentionally excludes payload
+// URLs, secrets and request and response bodies, and the read-only endpoint
+// does not trigger any delivery.
+func hookStatusSummary(c *context.APIContext) {
+	summary, err := database.GetWebhookStatusSummaryByRepoID(c.Repo.Repository.ID)
+	if err != nil {
+		c.Errorf(err, "get webhook status summary by repository ID")
+		return
+	}
+	c.JSONSuccess(toRepositoryHookStatusSummary(summary))
+}
+
 // https://github.com/gogs/go-gogs-client/wiki/Repositories#create-a-hook
 type createHookRequest struct {
 	Type   string            `json:"type" binding:"Required"`

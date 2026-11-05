@@ -98,6 +98,24 @@ func toUserPublicKey(apiLink string, key *database.PublicKey) *types.UserPublicK
 	}
 }
 
+func toRepositoryHookStatusSummary(s *database.WebhookStatusSummary) *types.RepositoryHookStatusSummary {
+	return &types.RepositoryHookStatusSummary{
+		Total: s.Total,
+		Active: types.RepositoryHookStatusCount{
+			Total:          s.Active.Total,
+			NeverDelivered: s.Active.NeverDelivered,
+			Succeed:        s.Active.Succeed,
+			Failed:         s.Active.Failed,
+		},
+		Disabled: types.RepositoryHookStatusCount{
+			Total:          s.Disabled.Total,
+			NeverDelivered: s.Disabled.NeverDelivered,
+			Succeed:        s.Disabled.Succeed,
+			Failed:         s.Disabled.Failed,
+		},
+	}
+}
+
 func toRepositoryHook(repoLink string, w *database.Webhook) *types.RepositoryHook {
 	config := map[string]string{
 		"url":          w.URL,

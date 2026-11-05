@@ -257,6 +257,7 @@ func RegisterRoutes(m *macaron.Macaron) {
 					m.Combo("").
 						Get(listHooks).
 						Post(bind(createHookRequest{}), createHook)
+					m.Get("/status-summary", hookStatusSummary)
 					m.Combo("/:id").
 						Patch(bind(editHookRequest{}), editHook).
 						Delete(deleteHook)

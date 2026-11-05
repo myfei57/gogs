@@ -303,6 +303,66 @@ func GetWebhooksByRepoID(repoID int64) ([]*Webhook, error) {
 	return webhooks, x.Find(&webhooks, &Webhook{RepoID: repoID})
 }
 
+// WebhookStatusCount groups webhooks that share the same enabled state by their
+// last delivery status.
+type WebhookStatusCount struct {
+	// Total is the number of webhooks in the enabled state.
+	Total int `json:"total"`
+	// NeverDelivered is the number of webhooks that have never been delivered
+	// (last delivery status is HookStatusNone).
+	NeverDelivered int `json:"never_delivered"`
+	// Succeed is the number of webhooks whose last delivery succeeded.
+	Succeed int `json:"succeed"`
+	// Failed is the number of webhooks whose last delivery failed.
+	Failed int `json:"failed"`
+}
+
+// WebhookStatusSummary is the number of webhooks in a repository grouped by
+// enabled state and last delivery status. It only contains counters, never
+// webhook configuration or delivery payload data.
+type WebhookStatusSummary struct {
+	// Total is the total number of webhooks in the repository.
+	Total int `json:"total"`
+	// Active is the status count of enabled webhooks (IsActive is true).
+	Active WebhookStatusCount `json:"active"`
+	// Disabled is the status count of disabled webhooks (IsActive is false).
+	Disabled WebhookStatusCount `json:"disabled"`
+}
+
+// GetWebhookStatusSummaryByRepoID counts webhooks of the repository grouped by
+// enabled state and last delivery status. Only the status columns are read, so
+// payload URLs, secrets and hook task request and response content are never
+// loaded. The function does not trigger any delivery.
+func GetWebhookStatusSummaryByRepoID(repoID int64) (*WebhookStatusSummary, error) {
+	// NOTE: Only the columns needed for aggregation are selected to avoid
+	// loading sensitive webhook configuration into memory.
+	webhooks := make([]*Webhook, 0, 5)
+	err := x.Cols("is_active", "last_status").
+		Where("repo_id = ?", repoID).
+		Find(&webhooks)
+	if err != nil {
+		return nil, err
+	}
+
+	summary := &WebhookStatusSummary{Total: len(webhooks)}
+	for _, w := range webhooks {
+		count := &summary.Disabled
+		if w.IsActive {
+			count = &summary.Active
+		}
+		count.Total++
+		switch w.LastStatus {
+		case HookStatusSucceed:
+			count.Succeed++
+		case HookStatusFailed:
+			count.Failed++
+		default:
+			count.NeverDelivered++
+		}
+	}
+	return summary, nil
+}
+
 // UpdateWebhook updates information of webhook.
 func UpdateWebhook(w *Webhook) error {
 	_, err := x.Id(w.ID).AllCols().Update(w)

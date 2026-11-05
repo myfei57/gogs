@@ -107,7 +107,8 @@ func getEngine() (*xorm.Engine, error) {
 }
 
 func NewTestEngine() error {
-	x, err := getEngine()
+	var err error
+	x, err = getEngine()
 	if err != nil {
 		return errors.Newf("connect to database: %v", err)
 	}
@@ -118,6 +119,14 @@ func NewTestEngine() error {
 
 	x.SetMapper(core.GonicMapper{})
 	return x.StoreEngine("InnoDB").Sync2(legacyTables...)
+}
+
+// CloseTestEngine closes the database engine initialized by NewTestEngine.
+func CloseTestEngine() error {
+	if x == nil {
+		return nil
+	}
+	return x.Close()
 }
 
 func SetEngine() (*gorm.DB, error) {
