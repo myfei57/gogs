@@ -182,6 +182,10 @@ func Init(customConf string) error {
 	}
 	Repository.Root = ensureAbs(Repository.Root)
 	Repository.Upload.TempPath = ensureAbs(Repository.Upload.TempPath)
+	if Repository.DeleteRestoreTime == 0 {
+		// Soft-deleted repositories can be restored within 30 days by default.
+		Repository.DeleteRestoreTime = 30 * 24 * time.Hour
+	}
 
 	// *****************************
 	// ----- Database settings -----

@@ -174,6 +174,11 @@ var (
 			Schedule   string
 			OlderThan  time.Duration
 		} `ini:"cron.repo_archive_cleanup"`
+		DeletedRepoCleanup struct {
+			Enabled    bool
+			RunAtStart bool
+			Schedule   string
+		} `ini:"cron.deleted_repo_cleanup"`
 	}
 
 	// Git settings
@@ -324,6 +329,9 @@ type RepositoryOpts struct {
 	EnableRawFileRenderMode  bool
 	CommitsFetchConcurrency  int
 	DefaultBranch            string
+	// DeleteRestoreTime is the duration during which a soft-deleted repository
+	// can be restored. Zero means no restore deadline.
+	DeleteRestoreTime time.Duration
 
 	// Repository editor settings
 	Editor struct {

@@ -589,7 +589,49 @@ func SettingsRepos(c *context.Context) {
 	}
 	c.Data["Repos"] = repos
 
+	deletedRepos, err := database.GetRestorableRepositoriesByUserID(c.User.ID)
+	if err != nil {
+		c.Errorf(err, "get restorable repositories")
+		return
+	}
+	c.Data["DeletedRepos"] = deletedRepos
+
 	c.Success(tmplUserSettingsRepositories)
+}
+
+// SettingsRestoreRepo restores a soft-deleted repository owned by the user or
+// by an organization the user owns.
+func SettingsRestoreRepo(c *context.Context) {
+	repo, err := database.GetDeletedRepositoryByID(c.QueryInt64("id"))
+	if err != nil {
+		c.NotFoundOrError(err, "get deleted repository by ID")
+		return
+	}
+
+	owner, err := database.Handle.Users().GetByID(c.Req.Context(), repo.OwnerID)
+	if err != nil {
+		c.Errorf(err, "get repository owner")
+		return
+	}
+	if (owner.IsOrganization() && !owner.IsOwnedBy(c.User.ID)) ||
+		(!owner.IsOrganization() && owner.ID != c.User.ID) {
+		c.NotFound()
+		return
+	}
+
+	if err = database.RestoreRepository(c.User.ID, owner.ID, repo.ID); err != nil {
+		if database.IsErrRepoRestoreExpired(err) {
+			c.Flash.Error(c.Tr("settings.repos.restore_expired", repo.FullName()))
+			c.Redirect(conf.Server.Subpath + "/user/settings/repositories")
+			return
+		}
+		c.Errorf(err, "restore repository")
+		return
+	}
+
+	log.Trace("Repository restored: %s/%s", owner.Name, repo.Name)
+	c.Flash.Success(c.Tr("settings.repos.restore_success", repo.FullName()))
+	c.Redirect(conf.Server.Subpath + "/user/settings/repositories")
 }
 
 func SettingsLeaveRepo(c *context.Context) {

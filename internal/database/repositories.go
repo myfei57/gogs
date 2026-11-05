@@ -32,6 +32,12 @@ func (r *Repository) BeforeUpdate(tx *gorm.DB) error {
 func (r *Repository) AfterFind(_ *gorm.DB) error {
 	r.Created = time.Unix(r.CreatedUnix, 0).Local()
 	r.Updated = time.Unix(r.UpdatedUnix, 0).Local()
+	if r.DeletedUnix > 0 {
+		r.Deleted = time.Unix(r.DeletedUnix, 0).Local()
+	}
+	if r.RestoreDeadlineUnix > 0 {
+		r.RestoreDeadline = time.Unix(r.RestoreDeadlineUnix, 0).Local()
+	}
 	return nil
 }
 
@@ -171,6 +177,7 @@ func (s *RepositoriesStore) GetByCollaboratorID(ctx context.Context, collaborato
 		SELECT * FROM repository
 		JOIN access ON access.repo_id = repository.id AND access.user_id = @collaboratorID
 		WHERE access.mode >= @accessModeRead
+		AND repository.deleted_unix = 0
 		ORDER BY @orderBy
 		LIMIT @limit
 	*/
@@ -178,6 +185,7 @@ func (s *RepositoriesStore) GetByCollaboratorID(ctx context.Context, collaborato
 	return repos, s.db.WithContext(ctx).
 		Joins("JOIN access ON access.repo_id = repository.id AND access.user_id = ?", collaboratorID).
 		Where("access.mode >= ?", AccessModeRead).
+		Where("repository.deleted_unix = 0").
 		Order(orderBy).
 		Limit(limit).
 		Find(&repos).
@@ -196,8 +204,9 @@ func (s *RepositoriesStore) GetByCollaboratorIDWithAccessMode(ctx context.Contex
 			repository.*,
 			access.mode
 		FROM repository
-		JOIN access ON access.repo_id = repository.id AND access.user_id = @collaboratorID
-		WHERE access.mode >= @accessModeRead
+		JOIN access ON access.repo_id = repository.id AND access.user_id = ?
+		WHERE access.mode >= ?
+		AND repository.deleted_unix = 0
 	*/
 	var reposWithAccessMode []*struct {
 		*Repository
@@ -208,6 +217,7 @@ func (s *RepositoriesStore) GetByCollaboratorIDWithAccessMode(ctx context.Contex
 		Table("repository").
 		Joins("JOIN access ON access.repo_id = repository.id AND access.user_id = ?", collaboratorID).
 		Where("access.mode >= ?", AccessModeRead).
+		Where("repository.deleted_unix = 0").
 		Find(&reposWithAccessMode).
 		Error
 	if err != nil {

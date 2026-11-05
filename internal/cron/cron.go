@@ -62,6 +62,25 @@ func NewContext() {
 			go database.DeleteOldRepositoryArchives()
 		}
 	}
+	if conf.Cron.DeletedRepoCleanup.Enabled {
+		entry, err = c.AddFunc("Deleted repository cleanup", conf.Cron.DeletedRepoCleanup.Schedule, func() {
+			if err := database.PurgeExpiredRepositories(); err != nil {
+				log.Error("Cron.(deleted repository cleanup): %v", err)
+			}
+		})
+		if err != nil {
+			log.Fatal("Cron.(deleted repository cleanup): %v", err)
+		}
+		if conf.Cron.DeletedRepoCleanup.RunAtStart {
+			entry.Prev = time.Now()
+			entry.ExecTimes++
+			go func() {
+				if err := database.PurgeExpiredRepositories(); err != nil {
+					log.Error("Cron.(deleted repository cleanup): %v", err)
+				}
+			}()
+		}
+	}
 	c.Start()
 }
 

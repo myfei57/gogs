@@ -37,6 +37,36 @@
 						{{end}}
 					</div>
 				</div>
+
+				<h4 class="ui top attached header">
+					{{.i18n.Tr "settings.deleted_repos"}}
+				</h4>
+				<div class="ui attached segment repos">
+					<div class="ui middle aligned divided list">
+						{{range .DeletedRepos}}
+							<div class="item">
+								<span class="text light grey">
+									<i class="octicon octicon-trashcan"></i>
+								</span>
+								<span>{{.Owner.Name}}/{{.Name}}</span>
+								{{if .RestoreDeadline.IsZero}}
+									<span class="ui text light grey">{{$.i18n.Tr "settings.deleted_repo_restore_anytime"}}</span>
+								{{else}}
+									<span class="ui text light grey">{{$.i18n.Tr "settings.deleted_repo_restore_deadline"}} {{TimeSince .RestoreDeadline $.Lang}}</span>
+								{{end}}
+								<div class="right floated">
+									<form method="post" action="{{AppSubURL}}/user/settings/repositories/restore?id={{.ID}}">
+										<button class="ui green tiny basic button" type="submit">{{$.i18n.Tr "settings.restore"}}</button>
+									</form>
+								</div>
+							</div>
+						{{else}}
+							<div class="item">
+								<span class="text light grey">{{.i18n.Tr "settings.deleted_repos_none"}}</span>
+							</div>
+						{{end}}
+					</div>
+				</div>
 			</div>
 		</div>
 	</div>

@@ -283,11 +283,11 @@ func SettingsPost(c *context.Context, f form.RepoSetting) {
 			}
 		}
 
-		if err := database.DeleteRepository(c.Repo.Owner.ID, repo.ID); err != nil {
-			c.Error(err, "delete repository")
+		if err := database.SoftDeleteRepository(c.User.ID, c.Repo.Owner.ID, repo.ID); err != nil {
+			c.Error(err, "soft delete repository")
 			return
 		}
-		log.Trace("Repository deleted: %s/%s", c.Repo.Owner.Name, repo.Name)
+		log.Trace("Repository soft-deleted: %s/%s", c.Repo.Owner.Name, repo.Name)
 
 		c.Flash.Success(c.Tr("repo.settings.deletion_success"))
 		c.Redirect(userx.DashboardURLPath(c.Repo.Owner.Name, c.Repo.Owner.IsOrganization()))

@@ -502,6 +502,7 @@ func (org *User) GetUserRepositories(userID int64, page, pageSize int) ([]*Repos
 	}
 	repos := make([]*Repository, 0, pageSize)
 	if err = x.Where("owner_id = ?", org.ID).
+		And("deleted_unix = 0").
 		And(builder.Or(
 			builder.And(builder.Expr("is_private = ?", false), builder.Expr("is_unlisted = ?", false)),
 			builder.In("id", teamRepoIDs))).
@@ -512,6 +513,7 @@ func (org *User) GetUserRepositories(userID int64, page, pageSize int) ([]*Repos
 	}
 
 	repoCount, err := x.Where("owner_id = ?", org.ID).
+		And("deleted_unix = 0").
 		And(builder.Or(
 			builder.Expr("is_private = ?", false),
 			builder.In("id", teamRepoIDs))).
@@ -545,9 +547,11 @@ func (org *User) GetUserMirrorRepositories(userID int64) ([]*Repository, error) 
 
 	repos := make([]*Repository, 0, 10)
 	if err = x.Where("owner_id = ?", org.ID).
-		And("is_private = ?", false).
-		Or(builder.In("id", teamRepoIDs)).
+		And(builder.Or(
+						builder.Expr("is_private = ?", false),
+						builder.In("id", teamRepoIDs))).
 		And("is_mirror = ?", true). // Don't move up because it's an independent condition
+		And("deleted_unix = 0").
 		Desc("updated_unix").
 		Find(&repos); err != nil {
 		return nil, errors.Newf("get user repositories: %v", err)

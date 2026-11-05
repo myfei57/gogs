@@ -222,10 +222,30 @@ type Repository struct {
 	ForkID   int64
 	BaseRepo *Repository `xorm:"-" gorm:"-" json:"-"`
 
+	// Soft deletion. The repository is considered soft-deleted when DeletedUnix is
+	// set, and can be restored until RestoreDeadlineUnix. A zero value on all
+	// three fields means the repository is active.
+	DeletedByID         int64 `xorm:"INDEX" gorm:"index"`
+	DeletedUnix         int64 `xorm:"INDEX" gorm:"index"`
+	RestoreDeadlineUnix int64
+	Deleted             time.Time `xorm:"-" gorm:"-" json:"-"`
+	RestoreDeadline     time.Time `xorm:"-" gorm:"-" json:"-"`
+
 	Created     time.Time `xorm:"-" gorm:"-" json:"-"`
 	CreatedUnix int64
 	Updated     time.Time `xorm:"-" gorm:"-" json:"-"`
 	UpdatedUnix int64
+}
+
+// IsDeleted returns true if the repository has been soft-deleted.
+func (r *Repository) IsDeleted() bool {
+	return r.DeletedUnix > 0
+}
+
+// CanRestore returns true if the repository is still within its restore
+// deadline at the given time.
+func (r *Repository) CanRestore(now time.Time) bool {
+	return r.IsDeleted() && r.RestoreDeadlineUnix >= now.Unix()
 }
 
 func (r *Repository) BeforeInsert() {
@@ -249,6 +269,14 @@ func (r *Repository) AfterSet(colName string, _ xorm.Cell) {
 	case "external_tracker_style":
 		if r.ExternalTrackerStyle == "" {
 			r.ExternalTrackerStyle = markup.IssueNameStyleNumeric
+		}
+	case "deleted_unix":
+		if r.DeletedUnix > 0 {
+			r.Deleted = time.Unix(r.DeletedUnix, 0).Local()
+		}
+	case "restore_deadline_unix":
+		if r.RestoreDeadlineUnix > 0 {
+			r.RestoreDeadline = time.Unix(r.RestoreDeadlineUnix, 0).Local()
 		}
 	case "created_unix":
 		r.Created = time.Unix(r.CreatedUnix, 0).Local()
@@ -1278,7 +1306,7 @@ func CreateRepository(doer, owner *User, opts CreateRepoOptionsLegacy) (_ *Repos
 }
 
 func countRepositories(userID int64, private bool) int64 {
-	sess := x.Where("id > 0")
+	sess := x.Where("id > 0").And("deleted_unix = 0")
 
 	if userID > 0 {
 		sess.And("owner_id = ?", userID)
@@ -1310,7 +1338,8 @@ func CountUserRepositories(userID int64, private bool) int64 {
 
 func Repositories(page, pageSize int) (_ []*Repository, err error) {
 	repos := make([]*Repository, 0, pageSize)
-	return repos, x.Limit(pageSize, (page-1)*pageSize).Asc("id").Find(&repos)
+	return repos, x.Where("deleted_unix = 0").
+		Limit(pageSize, (page-1)*pageSize).Asc("id").Find(&repos)
 }
 
 // RepositoriesWithUsers returns number of repos in given page.
@@ -1554,7 +1583,7 @@ func ChangeRepositoryName(u *User, oldRepoName, newRepoName string) (err error) 
 
 func getRepositoriesByForkID(e Engine, forkID int64) ([]*Repository, error) {
 	repos := make([]*Repository, 0, 10)
-	return repos, e.Where("fork_id=?", forkID).Find(&repos)
+	return repos, e.Where("fork_id=?", forkID).And("deleted_unix = 0").Find(&repos)
 }
 
 // GetRepositoriesByForkID returns all repositories with given fork ID.
@@ -1564,7 +1593,7 @@ func GetRepositoriesByForkID(forkID int64) ([]*Repository, error) {
 
 func getNonMirrorRepositories(e Engine) ([]*Repository, error) {
 	repos := make([]*Repository, 0, 10)
-	return repos, e.Where("is_mirror = ?", false).Find(&repos)
+	return repos, e.Where("is_mirror = ?", false).And("deleted_unix = 0").Find(&repos)
 }
 
 // GetRepositoriesMirror returns only mirror repositories with user.
@@ -1700,6 +1729,11 @@ func DeleteRepository(ownerID, repoID int64) error {
 		&Webhook{RepoID: repoID},
 		&HookTask{RepoID: repoID},
 		&LFSObject{RepoID: repoID},
+		// Soft-deletion archives, no-op when the repository was never soft-deleted.
+		&DeletedCollaboration{RepoID: repoID},
+		&DeletedWebhook{RepoID: repoID},
+		&DeletedProtectBranch{RepoID: repoID},
+		&DeletedProtectBranchWhitelist{RepoID: repoID},
 	); err != nil {
 		return errors.Newf("deleteBeans: %v", err)
 	}
@@ -1738,8 +1772,12 @@ func DeleteRepository(ownerID, repoID int64) error {
 		}
 	}
 
-	if _, err = sess.Exec("UPDATE `user` SET num_repos=num_repos-1 WHERE id=?", ownerID); err != nil {
-		return err
+	// A soft-deleted repository has already been subtracted from the owner's
+	// repository count when it was soft-deleted.
+	if !repo.IsDeleted() {
+		if _, err = sess.Exec("UPDATE `user` SET num_repos=num_repos-1 WHERE id=?", ownerID); err != nil {
+			return err
+		}
 	}
 
 	if err = sess.Commit(); err != nil {
@@ -1766,6 +1804,382 @@ func DeleteRepository(ownerID, repoID int64) error {
 	return nil
 }
 
+// Soft-deletion archives. Columns and their declaration order must stay
+// identical to the active tables so rows can be moved atomically with
+// "INSERT INTO ... SELECT ..." and moved back the same way on restore.
+
+// DeletedCollaboration is an archived Collaboration removed during soft deletion.
+type DeletedCollaboration struct {
+	ID     int64
+	UserID int64
+	RepoID int64 `xorm:"INDEX" gorm:"index"`
+	Mode   AccessMode
+}
+
+// DeletedWebhook is an archived Webhook removed during soft deletion.
+type DeletedWebhook struct {
+	ID           int64
+	RepoID       int64 `xorm:"INDEX" gorm:"index"`
+	OrgID        int64
+	URL          string `xorm:"url TEXT"`
+	ContentType  HookContentType
+	Secret       string `xorm:"TEXT"`
+	Events       string `xorm:"TEXT"`
+	IsSSL        bool   `xorm:"is_ssl"`
+	IsActive     bool
+	HookTaskType HookTaskType
+	Meta         string `xorm:"TEXT"`
+	LastStatus   HookStatus
+
+	CreatedUnix int64
+	UpdatedUnix int64
+}
+
+// DeletedProtectBranch is an archived ProtectBranch removed during soft deletion.
+type DeletedProtectBranch struct {
+	ID                 int64
+	RepoID             int64 `xorm:"INDEX" gorm:"index"`
+	Name               string
+	Protected          bool
+	RequirePullRequest bool
+	EnableWhitelist    bool
+	WhitelistUserIDs   string `xorm:"TEXT"`
+	WhitelistTeamIDs   string `xorm:"TEXT"`
+}
+
+// DeletedProtectBranchWhitelist is an archived ProtectBranchWhitelist removed
+// during soft deletion.
+type DeletedProtectBranchWhitelist struct {
+	ID              int64
+	ProtectBranchID int64
+	RepoID          int64 `xorm:"INDEX" gorm:"index"`
+	Name            string
+	UserID          int64
+}
+
+var _ errx.NotFound = (*ErrRepoRestoreExpired)(nil)
+
+// ErrRepoRestoreExpired indicates the restore deadline of a soft-deleted
+// repository has passed.
+type ErrRepoRestoreExpired struct {
+	args errx.Args
+}
+
+// IsErrRepoRestoreExpired returns true if the error is ErrRepoRestoreExpired.
+func IsErrRepoRestoreExpired(err error) bool {
+	_, ok := err.(ErrRepoRestoreExpired)
+	return ok
+}
+
+func (err ErrRepoRestoreExpired) Error() string {
+	return fmt.Sprintf("repository restore deadline has expired: %v", err.args)
+}
+
+// NotFound implements the errx.NotFound interface.
+func (ErrRepoRestoreExpired) NotFound() bool {
+	return true
+}
+
+// ErrRepoNotDeleted indicates a repository that is expected to be soft-deleted
+// is still active.
+type ErrRepoNotDeleted struct {
+	args errx.Args
+}
+
+// IsErrRepoNotDeleted returns true if the error is ErrRepoNotDeleted.
+func IsErrRepoNotDeleted(err error) bool {
+	_, ok := err.(ErrRepoNotDeleted)
+	return ok
+}
+
+func (err ErrRepoNotDeleted) Error() string {
+	return fmt.Sprintf("repository is not soft-deleted: %v", err.args)
+}
+
+// ErrRepoAlreadyDeleted indicates a soft deletion is requested on a repository
+// that is already soft-deleted.
+type ErrRepoAlreadyDeleted struct {
+	args errx.Args
+}
+
+// IsErrRepoAlreadyDeleted returns true if the error is ErrRepoAlreadyDeleted.
+func IsErrRepoAlreadyDeleted(err error) bool {
+	_, ok := err.(ErrRepoAlreadyDeleted)
+	return ok
+}
+
+func (err ErrRepoAlreadyDeleted) Error() string {
+	return fmt.Sprintf("repository is already soft-deleted: %v", err.args)
+}
+
+// moveRepoRows copies rows of the active table matching the repository ID into
+// the archive table, or back when reverse is true, then removes the source
+// rows. Both tables must share the same column order.
+func moveRepoRows(e Engine, repoID int64, reverse bool, sourceTable, targetTable string) error {
+	if reverse {
+		sourceTable, targetTable = targetTable, sourceTable
+	}
+
+	insertSQL := dbx.Quote("INSERT INTO %s SELECT * FROM %s WHERE repo_id = ?", targetTable, sourceTable)
+	if _, err := e.Exec(insertSQL, repoID); err != nil {
+		return errors.Newf("copy rows from %q to %q: %v", sourceTable, targetTable, err)
+	}
+
+	deleteSQL := dbx.Quote("DELETE FROM %s WHERE repo_id = ?", sourceTable)
+	if _, err := e.Exec(deleteSQL, repoID); err != nil {
+		return errors.Newf("delete rows from %q: %v", sourceTable, err)
+	}
+	return nil
+}
+
+// archiveRepoRelations snapshots the relations that must survive a soft
+// deletion and removes them from the active tables.
+func archiveRepoRelations(e Engine, repoID int64) error {
+	// Collaborators and their repositories' webhooks and branch protections.
+	for _, tables := range [][2]string{
+		{"collaboration", "deleted_collaboration"},
+		{"webhook", "deleted_webhook"},
+		{"protect_branch", "deleted_protect_branch"},
+		{"protect_branch_whitelist", "deleted_protect_branch_whitelist"},
+	} {
+		if err := moveRepoRows(e, repoID, false, tables[0], tables[1]); err != nil {
+			return err
+		}
+	}
+
+	// The access table is derived from collaborations and team memberships, it
+	// is recalculated from the restored relations when the repository is
+	// restored. Hook tasks are transient delivery records and not archived.
+	if _, err := e.Delete(&Access{RepoID: repoID}); err != nil {
+		return errors.Newf("delete accesses: %v", err)
+	} else if _, err = e.Delete(&HookTask{RepoID: repoID}); err != nil {
+		return errors.Newf("delete hook tasks: %v", err)
+	}
+	return nil
+}
+
+// restoreRepoRelations puts the archived relations back to the active tables.
+func restoreRepoRelations(e Engine, repoID int64) error {
+	for _, tables := range [][2]string{
+		{"collaboration", "deleted_collaboration"},
+		{"webhook", "deleted_webhook"},
+		{"protect_branch", "deleted_protect_branch"},
+		{"protect_branch_whitelist", "deleted_protect_branch_whitelist"},
+	} {
+		if err := moveRepoRows(e, repoID, true, tables[0], tables[1]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SoftDeleteRepository marks the repository as deleted without removing its
+// data. It records the deleter, the deletion time and the restore deadline,
+// hides the repository from default listings, and archives its collaborators,
+// webhooks and branch protections so they can be atomically restored later.
+func SoftDeleteRepository(doerID, ownerID, repoID int64) error {
+	sess := x.NewSession()
+	defer sess.Close()
+	if err := sess.Begin(); err != nil {
+		return err
+	}
+
+	repo := new(Repository)
+	has, err := sess.ID(repoID).And("owner_id = ?", ownerID).Get(repo)
+	if err != nil {
+		return err
+	} else if !has {
+		return ErrRepoNotExist{args: errx.Args{"ownerID": ownerID, "repoID": repoID}}
+	}
+	if repo.IsDeleted() {
+		return ErrRepoAlreadyDeleted{args: errx.Args{"ownerID": ownerID, "repoID": repoID}}
+	}
+
+	if err = archiveRepoRelations(sess, repoID); err != nil {
+		return errors.Newf("archive repository relations: %v", err)
+	}
+
+	now := time.Now()
+	repo.DeletedByID = doerID
+	repo.DeletedUnix = now.Unix()
+	if conf.Repository.DeleteRestoreTime > 0 {
+		repo.RestoreDeadlineUnix = now.Add(conf.Repository.DeleteRestoreTime).Unix()
+	}
+	repo.UpdatedUnix = now.Unix()
+	if _, err = sess.ID(repoID).
+		Cols("deleted_by_id", "deleted_unix", "restore_deadline_unix", "updated_unix").
+		Update(repo); err != nil {
+		return errors.Newf("mark repository as soft-deleted: %v", err)
+	}
+
+	if _, err = sess.Exec("UPDATE `user` SET num_repos = num_repos - 1 WHERE id = ?", ownerID); err != nil {
+		return errors.Newf("decrease owner repository count: %v", err)
+	}
+
+	if err = sess.Commit(); err != nil {
+		return errors.Newf("commit: %v", err)
+	}
+
+	log.Trace("Repository soft-deleted [repo_id: %d, doer_id: %d]", repoID, doerID)
+	return nil
+}
+
+// RestoreRepository restores a soft-deleted repository within its restore
+// deadline. The archived collaborators, webhooks and branch protections are
+// moved back and the access table is recalculated, all within a single
+// transaction.
+func RestoreRepository(doerID, ownerID, repoID int64) error {
+	sess := x.NewSession()
+	defer sess.Close()
+	if err := sess.Begin(); err != nil {
+		return err
+	}
+
+	repo := new(Repository)
+	has, err := sess.ID(repoID).And("owner_id = ?", ownerID).Get(repo)
+	if err != nil {
+		return err
+	} else if !has {
+		return ErrRepoNotExist{args: errx.Args{"ownerID": ownerID, "repoID": repoID}}
+	}
+	if !repo.IsDeleted() {
+		return ErrRepoNotDeleted{args: errx.Args{"ownerID": ownerID, "repoID": repoID}}
+	}
+	if repo.RestoreDeadlineUnix > 0 && time.Now().Unix() > repo.RestoreDeadlineUnix {
+		return ErrRepoRestoreExpired{args: errx.Args{"ownerID": ownerID, "repoID": repoID}}
+	}
+
+	if err = restoreRepoRelations(sess, repoID); err != nil {
+		return errors.Newf("restore repository relations: %v", err)
+	}
+
+	now := time.Now()
+	repo.DeletedByID = 0
+	repo.DeletedUnix = 0
+	repo.RestoreDeadlineUnix = 0
+	repo.UpdatedUnix = now.Unix()
+	if _, err = sess.ID(repoID).
+		Cols("deleted_by_id", "deleted_unix", "restore_deadline_unix", "updated_unix").
+		Update(repo); err != nil {
+		return errors.Newf("clear soft-deletion marks: %v", err)
+	}
+
+	if _, err = sess.Exec("UPDATE `user` SET num_repos = num_repos + 1 WHERE id = ?", ownerID); err != nil {
+		return errors.Newf("increase owner repository count: %v", err)
+	}
+
+	// Rebuild derived accesses from the restored collaborations and the
+	// existing team relations inside the same transaction.
+	if err = repo.loadAttributes(sess); err != nil {
+		return errors.Newf("load repository attributes: %v", err)
+	}
+	if err = repo.recalculateAccesses(sess); err != nil {
+		return errors.Newf("recalculate accesses: %v", err)
+	}
+
+	if err = sess.Commit(); err != nil {
+		return errors.Newf("commit: %v", err)
+	}
+
+	log.Trace("Repository restored [repo_id: %d, doer_id: %d]", repoID, doerID)
+	return nil
+}
+
+// GetDeletedRepositoryByID returns a soft-deleted repository by given ID. It
+// returns ErrRepoNotExist when the repository does not exist or is active.
+func GetDeletedRepositoryByID(id int64) (*Repository, error) {
+	repo := new(Repository)
+	has, err := x.ID(id).And("deleted_unix > 0").Get(repo)
+	if err != nil {
+		return nil, err
+	} else if !has {
+		return nil, ErrRepoNotExist{args: errx.Args{"repoID": id}}
+	}
+	return repo, repo.LoadAttributes()
+}
+
+// GetDeletedRepositoryByName returns a soft-deleted repository by given owner
+// and name. It returns ErrRepoNotExist when the repository does not exist or is
+// active.
+func GetDeletedRepositoryByName(ownerID int64, name string) (*Repository, error) {
+	repo := new(Repository)
+	has, err := x.Where("owner_id = ?", ownerID).
+		And("lower_name = ?", strings.ToLower(name)).
+		And("deleted_unix > 0").
+		Get(repo)
+	if err != nil {
+		return nil, err
+	} else if !has {
+		return nil, ErrRepoNotExist{args: errx.Args{"ownerID": ownerID, "name": name}}
+	}
+	return repo, repo.LoadAttributes()
+}
+
+// GetDeletedRepositoriesByOwner returns all soft-deleted repositories of the
+// given owner, including expired ones.
+func GetDeletedRepositoriesByOwner(ownerID int64) ([]*Repository, error) {
+	repos := make([]*Repository, 0, 10)
+	return repos, x.Where("owner_id = ?", ownerID).
+		And("deleted_unix > 0").
+		Desc("deleted_unix").
+		Find(&repos)
+}
+
+// GetRestorableRepositoriesByUserID returns soft-deleted repositories the user
+// is allowed to restore, i.e. repositories owned by the user or by organizations
+// the user owns.
+func GetRestorableRepositoriesByUserID(userID int64) ([]*Repository, error) {
+	ownerIDs := []int64{userID}
+	orgs, err := GetOwnedOrgsByUserID(userID)
+	if err != nil {
+		return nil, errors.Newf("get owned organizations: %v", err)
+	}
+	for _, org := range orgs {
+		ownerIDs = append(ownerIDs, org.ID)
+	}
+
+	repos := make([]*Repository, 0, 10)
+	if err = x.In("owner_id", ownerIDs).
+		And("deleted_unix > 0").
+		Desc("deleted_unix").
+		Find(&repos); err != nil {
+		return nil, errors.Newf("find restorable repositories: %v", err)
+	}
+	return repos, RepositoryList(repos).LoadAttributes()
+}
+
+// PurgeExpiredRepositories permanently deletes soft-deleted repositories whose
+// restore deadline has passed.
+func PurgeExpiredRepositories() error {
+	if taskStatusTable.IsRunning(taskNamePurgeDeletedRepos) {
+		return nil
+	}
+	taskStatusTable.Start(taskNamePurgeDeletedRepos)
+	defer taskStatusTable.Stop(taskNamePurgeDeletedRepos)
+
+	log.Trace("Doing: PurgeExpiredRepositories")
+
+	repos := make([]*Repository, 0, 10)
+	if err := x.Where("deleted_unix > 0").
+		And("restore_deadline_unix > 0").
+		And("restore_deadline_unix <= ?", time.Now().Unix()).
+		Find(&repos); err != nil {
+		return errors.Newf("find expired repositories: %v", err)
+	}
+
+	for _, repo := range repos {
+		log.Trace("Purging expired repository [repo_id: %d]...", repo.ID)
+		if err := DeleteRepository(repo.OwnerID, repo.ID); err != nil {
+			err = errors.Newf("DeleteRepository [%d]: %v", repo.ID, err)
+			log.Error("%v", err)
+			if err2 := Handle.Notices().Create(context.TODO(), NoticeTypeRepository, err.Error()); err2 != nil {
+				return errors.Newf("create repository notice: %v", err2)
+			}
+		}
+	}
+	return nil
+}
+
 // GetRepositoryByRef returns a Repository specified by a GFM reference.
 // See https://help.github.com/articles/writing-on-github#references for more information on the syntax.
 func GetRepositoryByRef(ref string) (*Repository, error) {
@@ -1784,13 +2198,15 @@ func GetRepositoryByRef(ref string) (*Repository, error) {
 }
 
 // GetRepositoryByName returns the repository by given name under user if exists.
+// Soft-deleted repositories are not visible here and resolve to ErrRepoNotExist,
+// use GetDeletedRepositoryByName to look one up for restoration.
 // Deprecated: Use Repos.GetByName instead.
 func GetRepositoryByName(ownerID int64, name string) (*Repository, error) {
 	repo := &Repository{
 		OwnerID:   ownerID,
 		LowerName: strings.ToLower(name),
 	}
-	has, err := x.Get(repo)
+	has, err := x.Where("deleted_unix = 0").Get(repo)
 	if err != nil {
 		return nil, err
 	} else if !has {
@@ -1824,7 +2240,7 @@ type UserRepoOptions struct {
 
 // GetUserRepositories returns a list of repositories of given user.
 func GetUserRepositories(opts *UserRepoOptions) ([]*Repository, error) {
-	sess := x.Where("owner_id=?", opts.UserID).Desc("updated_unix")
+	sess := x.Where("owner_id=?", opts.UserID).And("deleted_unix = 0").Desc("updated_unix")
 	if !opts.Private {
 		sess.And("is_private=?", false)
 		sess.And("is_unlisted=?", false)
@@ -1842,13 +2258,18 @@ func GetUserRepositories(opts *UserRepoOptions) ([]*Repository, error) {
 // GetUserRepositories returns a list of mirror repositories of given user.
 func GetUserMirrorRepositories(userID int64) ([]*Repository, error) {
 	repos := make([]*Repository, 0, 10)
-	return repos, x.Where("owner_id = ?", userID).And("is_mirror = ?", true).Find(&repos)
+	return repos, x.Where("owner_id = ?", userID).
+		And("is_mirror = ?", true).
+		And("deleted_unix = 0").
+		Find(&repos)
 }
 
 // GetRecentUpdatedRepositories returns the list of repositories that are recently updated.
 func GetRecentUpdatedRepositories(page, pageSize int) (repos []*Repository, err error) {
 	return repos, x.Limit(pageSize, (page-1)*pageSize).
-		Where("is_private=?", false).Limit(pageSize).Desc("updated_unix").Find(&repos)
+		Where("is_private=?", false).
+		And("deleted_unix = 0").
+		Limit(pageSize).Desc("updated_unix").Find(&repos)
 }
 
 // GetUserAndCollaborativeRepositories returns list of repositories the user owns and collaborates.
@@ -1857,12 +2278,13 @@ func GetUserAndCollaborativeRepositories(userID int64) ([]*Repository, error) {
 	if err := x.Alias("repo").
 		Join("INNER", "collaboration", "collaboration.repo_id = repo.id").
 		Where("collaboration.user_id = ?", userID).
+		And("repo.deleted_unix = 0").
 		Find(&repos); err != nil {
 		return nil, errors.Newf("select collaborative repositories: %v", err)
 	}
 
 	ownRepos := make([]*Repository, 0, 10)
-	if err := x.Where("owner_id = ?", userID).Find(&ownRepos); err != nil {
+	if err := x.Where("owner_id = ?", userID).And("deleted_unix = 0").Find(&ownRepos); err != nil {
 		return nil, errors.Newf("select own repositories: %v", err)
 	}
 
@@ -1887,7 +2309,7 @@ func SearchRepositoryByName(opts *SearchRepoOptions) (repos []*Repository, count
 	}
 
 	repos = make([]*Repository, 0, opts.PageSize)
-	sess := x.Alias("repo")
+	sess := x.Alias("repo").And("repo.deleted_unix = 0")
 	// Attempt to find repositories that opts.UserID has access to,
 	// this does not include other people's private repositories even if opts.UserID is an admin.
 	if !opts.Private && opts.UserID > 0 {
@@ -2075,10 +2497,11 @@ func SyncRepositoryHooks() error {
 var taskStatusTable = sync.NewStatusTable()
 
 const (
-	taskNameMirrorUpdate     = "mirror_update"
-	taskNameGitFSCK          = "git_fsck"
-	taskNameCheckRepoStats   = "check_repos_stats"
-	taskNameCleanOldArchives = "clean_old_archives"
+	taskNameMirrorUpdate      = "mirror_update"
+	taskNameGitFSCK           = "git_fsck"
+	taskNameCheckRepoStats    = "check_repos_stats"
+	taskNameCleanOldArchives  = "clean_old_archives"
+	taskNamePurgeDeletedRepos = "purge_deleted_repos"
 )
 
 // GitFsck calls 'git fsck' to check repository health.

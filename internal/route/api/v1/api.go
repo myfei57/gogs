@@ -251,6 +251,7 @@ func RegisterRoutes(m *macaron.Macaron) {
 		m.Group("/repos", func() {
 			m.Post("/migrate", bind(form.MigrateRepo{}), migrate)
 			m.Delete("/:username/:reponame", repoAssignment(), reqRepoOwner(), deleteRepo)
+			m.Post("/:username/:reponame/restore", reqToken(), restoreRepo)
 
 			m.Group("/:username/:reponame", func() {
 				m.Group("/hooks", func() {

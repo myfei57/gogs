@@ -114,6 +114,7 @@ func Run(configPath string, portOverride int) error {
 			m.Group("/repositories", func() {
 				m.Get("", user.SettingsRepos)
 				m.Post("/leave", user.SettingsLeaveRepo)
+				m.Post("/restore", user.SettingsRestoreRepo)
 			})
 			m.Group("/organizations", func() {
 				m.Get("", user.SettingsOrganizations)

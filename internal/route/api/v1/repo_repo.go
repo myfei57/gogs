@@ -349,13 +349,54 @@ func deleteRepo(c *context.APIContext) {
 		return
 	}
 
-	if err := database.DeleteRepository(owner.ID, repo.ID); err != nil {
-		c.Error(err, "delete repository")
+	if err := database.SoftDeleteRepository(c.User.ID, owner.ID, repo.ID); err != nil {
+		c.Error(err, "soft delete repository")
 		return
 	}
 
-	log.Trace("Repository deleted: %s/%s", owner.Name, repo.Name)
+	log.Trace("Repository soft-deleted: %s/%s", owner.Name, repo.Name)
 	c.NoContent()
+}
+
+func restoreRepo(c *context.APIContext) {
+	owner, err := database.Handle.Users().GetByUsername(c.Req.Context(), c.Params(":username"))
+	if err != nil {
+		if database.IsErrUserNotExist(err) {
+			c.ErrorStatus(http.StatusUnprocessableEntity, err)
+		} else {
+			c.Error(err, "get user by name")
+		}
+		return
+	}
+
+	repo, err := database.GetDeletedRepositoryByName(owner.ID, c.Params(":reponame"))
+	if err != nil {
+		c.NotFoundOrError(err, "get deleted repository by name")
+		return
+	}
+
+	if owner.IsOrganization() && !owner.IsOwnedBy(c.User.ID) {
+		c.ErrorStatus(http.StatusForbidden, errors.New("Given user is not owner of organization."))
+		return
+	} else if !owner.IsOrganization() && owner.ID != c.User.ID && !c.User.IsAdmin {
+		c.ErrorStatus(http.StatusForbidden, errors.New("Given user is not the repository owner."))
+		return
+	}
+
+	if err = database.RestoreRepository(c.User.ID, owner.ID, repo.ID); err != nil {
+		switch {
+		case database.IsErrRepoRestoreExpired(err):
+			c.ErrorStatus(http.StatusGone, err)
+		case database.IsErrRepoNotDeleted(err):
+			c.ErrorStatus(http.StatusConflict, err)
+		default:
+			c.Error(err, "restore repository")
+		}
+		return
+	}
+
+	log.Trace("Repository restored: %s/%s", owner.Name, repo.Name)
+	c.JSON(http.StatusOK, toRepository(repo, &types.RepositoryPermission{Admin: true, Push: true, Pull: true}))
 }
 
 func listForks(c *context.APIContext) {

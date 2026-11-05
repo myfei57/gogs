@@ -372,6 +372,8 @@ func MirrorUpdate() {
 		if m.Repo == nil {
 			log.Error("Disconnected mirror repository found: %d", m.ID)
 			return nil
+		} else if m.Repo.IsDeleted() {
+			return nil
 		}
 
 		MirrorQueue.Add(m.RepoID)
