@@ -891,6 +891,52 @@ func MigrateRepository(doer, owner *User, opts MigrateRepoOptions) (*Repository,
 	return CleanUpMigrateInfo(repo)
 }
 
+// ErrMigrateRemoteAuthFailed is returned when the remote repository rejects
+// the credentials used to access it during the migration precheck.
+type ErrMigrateRemoteAuthFailed struct {
+	message string
+}
+
+// IsErrMigrateRemoteAuthFailed returns true if the error is
+// ErrMigrateRemoteAuthFailed.
+func IsErrMigrateRemoteAuthFailed(err error) bool {
+	_, ok := err.(ErrMigrateRemoteAuthFailed)
+	return ok
+}
+
+func (err ErrMigrateRemoteAuthFailed) Error() string {
+	return err.message
+}
+
+// CheckMigrateRemoteAddress verifies the given remote repository address is
+// accessible with the credentials embedded in it by listing its remote HEAD.
+// It returns nil when the address is accessible, ErrMigrateRemoteAuthFailed
+// when the remote rejects the credentials, and a different error otherwise.
+// It performs no writes.
+func CheckMigrateRemoteAddress(timeout time.Duration, remoteAddr string) error {
+	args := append(mirrorGitArgs(), "ls-remote", "--quiet", "--end-of-options", remoteAddr, "HEAD")
+	_, stderr, err := process.ExecTimeoutEnv(
+		timeout, mirrorGitEnv(),
+		fmt.Sprintf("CheckMigrateRemoteAddress: %s", HandleMirrorCredentials(remoteAddr, true)),
+		"git", args...,
+	)
+	if err == nil {
+		return nil
+	}
+
+	detail := strings.TrimSpace(stderr)
+	if strings.Contains(detail, "Authentication failed") ||
+		strings.Contains(detail, "could not read Username") ||
+		strings.Contains(detail, "could not read Password") ||
+		strings.Contains(detail, "Invalid credentials") ||
+		strings.Contains(detail, "403 Forbidden") {
+		return ErrMigrateRemoteAuthFailed{
+			message: fmt.Sprintf("Remote repository rejected the provided credentials: %s", HandleMirrorCredentials(detail, true)),
+		}
+	}
+	return errors.Newf("git ls-remote: %v - %s", err, HandleMirrorCredentials(detail, true))
+}
+
 // cleanUpMigrateGitConfig removes mirror info which prevents "push --all".
 // This also removes possible user credentials.
 func cleanUpMigrateGitConfig(configPath string) error {
@@ -1135,6 +1181,12 @@ var (
 // isRepoNameAllowed return an error if given name is a reserved name or pattern for repositories.
 func isRepoNameAllowed(name string) error {
 	return isNameAllowed(reservedRepoNames, reservedRepoPatterns, name)
+}
+
+// IsRepoNameAllowed returns an error if the given name is a reserved name or
+// pattern for repositories. It performs no writes.
+func IsRepoNameAllowed(name string) error {
+	return isRepoNameAllowed(name)
 }
 
 func createRepository(e *xorm.Session, doer, owner *User, repo *Repository) (err error) {

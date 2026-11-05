@@ -1,8 +1,15 @@
 package v1
 
 import (
+	stdctx "context"
+	"fmt"
+	"io"
 	"net/http"
+	"net/url"
+	"os"
 	"path"
+	"strings"
+	"time"
 
 	"github.com/cockroachdb/errors"
 	log "unknwon.dev/clog/v2"
@@ -11,6 +18,7 @@ import (
 	"gogs.io/gogs/internal/context"
 	"gogs.io/gogs/internal/database"
 	"gogs.io/gogs/internal/form"
+	"gogs.io/gogs/internal/lfsx"
 	"gogs.io/gogs/internal/route/api/v1/types"
 )
 
@@ -302,6 +310,306 @@ func migrate(c *context.APIContext, f form.MigrateRepo) {
 
 	log.Trace("Repository migrated: %s/%s", ctxUser.Name, f.RepoName)
 	c.JSON(201, toRepository(repo, &types.RepositoryPermission{Admin: true, Push: true, Pull: true}))
+}
+
+type precheckStepStatus string
+
+const (
+	precheckStepSuccess precheckStepStatus = "success"
+	precheckStepFailed  precheckStepStatus = "failed"
+	precheckStepWarning precheckStepStatus = "warning"
+	precheckStepSkipped precheckStepStatus = "skipped"
+)
+
+type migratePrecheckStep struct {
+	Name    string             `json:"name"`
+	Status  precheckStepStatus `json:"status"`
+	Message string             `json:"message"`
+}
+
+type migratePrecheckResponse struct {
+	CanImport bool                  `json:"can_import"`
+	Steps     []migratePrecheckStep `json:"steps"`
+}
+
+func appendPrecheckStep(steps []migratePrecheckStep, name string, status precheckStepStatus, message string) []migratePrecheckStep {
+	return append(steps, migratePrecheckStep{
+		Name:    name,
+		Status:  status,
+		Message: message,
+	})
+}
+
+// precheckMigrate runs read-only validation for the repository migration
+// request and returns step-by-step diagnostics. It does not create the
+// repository nor write to the repository or hook tables.
+func precheckMigrate(c *context.APIContext, f form.MigrateRepo) {
+	ctxUser := c.User
+	// Not equal means context user is an organization,
+	// or is another user/organization if current user is admin.
+	if f.UID != ctxUser.ID {
+		org, err := database.Handle.Users().GetByID(c.Req.Context(), f.UID)
+		if err != nil {
+			if database.IsErrUserNotExist(err) {
+				c.ErrorStatus(http.StatusUnprocessableEntity, err)
+			} else {
+				c.Error(err, "get user by ID")
+			}
+			return
+		} else if !org.IsOrganization() && !c.User.IsAdmin {
+			c.ErrorStatus(http.StatusForbidden, errors.New("Given user is not an organization."))
+			return
+		}
+		ctxUser = org
+	}
+
+	if c.HasError() {
+		c.ErrorStatus(http.StatusUnprocessableEntity, errors.New(c.GetErrMsg()))
+		return
+	}
+
+	if ctxUser.IsOrganization() && !c.User.IsAdmin {
+		// Check ownership of organization.
+		if !ctxUser.IsOwnedBy(c.User.ID) {
+			c.ErrorStatus(http.StatusForbidden, errors.New("Given user is not owner of organization."))
+			return
+		}
+	}
+
+	canImport := true
+	steps := make([]migratePrecheckStep, 0, 4)
+
+	// Step 1: Validate the clone address.
+	remoteAddr, err := form.ParseRemoteAddr(form.ParseRemoteAddrOptions{
+		CloneAddr:    f.CloneAddr,
+		User:         c.User,
+		AuthUsername: f.AuthUsername,
+		AuthPassword: f.AuthPassword,
+	})
+	remoteAddrOK := err == nil
+	if !remoteAddrOK {
+		canImport = false
+		steps = appendPrecheckStep(steps, "clone_address", precheckStepFailed, invalidCloneAddrMessage(err))
+	} else {
+		steps = appendPrecheckStep(steps, "clone_address", precheckStepSuccess, "The clone address is valid.")
+	}
+
+	// Step 2: Validate the repository name and check for conflicts.
+	if nameErr := database.IsRepoNameAllowed(f.RepoName); nameErr != nil {
+		canImport = false
+		steps = appendPrecheckStep(steps, "repository_name", precheckStepFailed,
+			fmt.Sprintf("Repository name %q is not allowed.", f.RepoName))
+	} else {
+		_, getErr := database.Handle.Repositories().GetByName(c.Req.Context(), ctxUser.ID, f.RepoName)
+		switch {
+		case getErr == nil:
+			canImport = false
+			steps = appendPrecheckStep(steps, "repository_name", precheckStepFailed,
+				fmt.Sprintf("Repository name %q has already been taken.", f.RepoName))
+		case database.IsErrRepoNotExist(getErr):
+			steps = appendPrecheckStep(steps, "repository_name", precheckStepSuccess, "The repository name is available.")
+		default:
+			c.Error(getErr, "get repository by name")
+			return
+		}
+	}
+
+	// Step 3: Verify credentials and source repository accessibility.
+	if !remoteAddrOK {
+		steps = appendPrecheckStep(steps, "authentication", precheckStepSkipped,
+			"Skipped because the clone address validation failed.")
+	} else {
+		timeout := time.Duration(conf.Git.Timeout.Migrate) * time.Second
+		checkErr := database.CheckMigrateRemoteAddress(timeout, remoteAddr)
+		switch {
+		case checkErr == nil:
+			steps = appendPrecheckStep(steps, "authentication", precheckStepSuccess,
+				"The source repository is accessible with the provided credentials.")
+		case database.IsErrMigrateRemoteAuthFailed(checkErr):
+			canImport = false
+			steps = appendPrecheckStep(steps, "authentication", precheckStepFailed, checkErr.Error())
+		default:
+			canImport = false
+			steps = appendPrecheckStep(steps, "authentication", precheckStepFailed,
+				"The source repository is not accessible: "+checkErr.Error())
+		}
+	}
+
+	// Step 4: Check Git LFS capability, both locally and on the source server.
+	status, message := precheckLFSStep(c.Req.Context(), remoteAddr, remoteAddrOK)
+	if status == precheckStepFailed {
+		canImport = false
+	}
+	steps = appendPrecheckStep(steps, "lfs", status, message)
+
+	c.JSONSuccess(map[string]any{
+		"ok":   true,
+		"data": migratePrecheckResponse{CanImport: canImport, Steps: steps},
+	})
+}
+
+func invalidCloneAddrMessage(err error) string {
+	if !database.IsErrInvalidCloneAddr(err) {
+		return "Failed to parse the clone address: " + err.Error()
+	}
+	addrErr := err.(database.ErrInvalidCloneAddr)
+	switch {
+	case addrErr.IsURLError:
+		return "The clone address is not a valid URL."
+	case addrErr.IsPermissionDenied:
+		return "You are not allowed to import local repositories."
+	case addrErr.IsInvalidPath:
+		return "The local path does not exist or is not a directory."
+	case addrErr.IsBlockedLocalAddress:
+		return "The clone address resolved to a local network address that is implicitly blocked."
+	default:
+		return "The clone address is invalid."
+	}
+}
+
+// checkLocalLFSStorage verifies the configured LFS storage backend is
+// supported and the objects directory is writable. It creates a probe file
+// under the objects directory and removes it, so it leaves no data behind.
+// It performs no database writes.
+func checkLocalLFSStorage(storage lfsx.Storage, objectsPath string) error {
+	if storage != lfsx.StorageLocal {
+		return errors.Newf("unsupported LFS storage backend %q, only %q is supported", storage, lfsx.StorageLocal)
+	}
+
+	if err := os.MkdirAll(objectsPath, os.ModePerm); err != nil {
+		return errors.Wrap(err, "create LFS objects directory")
+	}
+
+	probe, err := os.CreateTemp(objectsPath, "precheck-*")
+	if err != nil {
+		return errors.Wrap(err, "write probe file to LFS objects directory")
+	}
+	probePath := probe.Name()
+	_ = probe.Close()
+	_ = os.Remove(probePath)
+	return nil
+}
+
+type remoteLFSStatus int
+
+const (
+	remoteLFSUnknown remoteLFSStatus = iota
+	remoteLFSSupported
+	remoteLFSUnsupported
+)
+
+const precheckLFSContentType = "application/vnd.git-lfs+json"
+
+// lfsBatchEndpoint derives the Git LFS Batch API endpoint from the clone
+// address. Credentials are extracted separately so they never appear in the
+// endpoint URL or in error messages.
+func lfsBatchEndpoint(remoteAddr string) (endpoint, username, password string, err error) {
+	u, err := url.Parse(remoteAddr)
+	if err != nil {
+		return "", "", "", errors.Wrap(err, "parse remote address")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", "", "", errors.Newf("unsupported URL scheme %q", u.Scheme)
+	}
+
+	if u.User != nil {
+		username = u.User.Username()
+		password, _ = u.User.Password()
+		u.User = nil
+	}
+
+	u.Path = strings.TrimSuffix(u.Path, "/")
+	if !strings.HasSuffix(u.Path, ".git") {
+		u.Path += ".git"
+	}
+	u.Path += "/info/lfs/objects/batch"
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String(), username, password, nil
+}
+
+// probeRemoteLFS checks whether the source server serves the Git LFS Batch
+// API by sending a minimal download request. A 404 or 410 response means LFS
+// is unsupported, any other response means the endpoint is served (including
+// 401 or 403, which indicate LFS is served but the request needs authorization),
+// and a transport failure leaves the result undetermined.
+func probeRemoteLFS(ctx stdctx.Context, remoteAddr string) (remoteLFSStatus, error) {
+	endpoint, username, password, err := lfsBatchEndpoint(remoteAddr)
+	if err != nil {
+		return remoteLFSUnknown, err
+	}
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		endpoint,
+		strings.NewReader(`{"operation":"download","transfers":["basic"],"objects":[]}`),
+	)
+	if err != nil {
+		return remoteLFSUnknown, errors.Wrap(err, "create LFS batch request")
+	}
+	req.Header.Set("Accept", precheckLFSContentType)
+	req.Header.Set("Content-Type", precheckLFSContentType)
+	if username != "" {
+		req.SetBasicAuth(username, password)
+	}
+
+	client := &http.Client{
+		// Do not follow redirects to prevent a public URL from redirecting the
+		// probe to an internal endpoint, matching the policy used by git.
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return remoteLFSUnknown, errors.New("failed to connect to the Git LFS endpoint")
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
+
+	switch resp.StatusCode {
+	case http.StatusNotFound, http.StatusGone:
+		return remoteLFSUnsupported, nil
+	default:
+		return remoteLFSSupported, nil
+	}
+}
+
+// precheckLFSStep checks the local LFS storage readiness and, when the source
+// is an HTTP(S) repository, the source LFS capability.
+func precheckLFSStep(reqCtx stdctx.Context, remoteAddr string, remoteAddrOK bool) (precheckStepStatus, string) {
+	if err := checkLocalLFSStorage(lfsx.Storage(conf.LFS.Storage), conf.LFS.ObjectsPath); err != nil {
+		return precheckStepFailed, "Git LFS is not available on this server: " + err.Error()
+	}
+
+	if !remoteAddrOK {
+		return precheckStepWarning,
+			"Local LFS storage is ready. Source LFS capability was not checked because the clone address validation failed."
+	}
+
+	endpoint, _, _, err := lfsBatchEndpoint(remoteAddr)
+	if err != nil {
+		// Non-HTTP sources (e.g. the git protocol or a local path) do not
+		// expose the LFS Batch API.
+		return precheckStepSuccess, "Local LFS storage is ready. The source does not use HTTP, so source LFS capability was not checked."
+	}
+
+	ctx, cancel := stdctx.WithTimeout(reqCtx, time.Duration(conf.Git.Timeout.Migrate)*time.Second)
+	defer cancel()
+
+	status, probeErr := probeRemoteLFS(ctx, remoteAddr)
+	switch status {
+	case remoteLFSSupported:
+		return precheckStepSuccess, "The source server supports Git LFS, and local LFS storage is ready. Endpoint: " + endpoint
+	case remoteLFSUnsupported:
+		return precheckStepWarning, "The source server does not support Git LFS. LFS objects will not be available for the imported repository."
+	default:
+		log.Warn("Failed to probe Git LFS capability of %q: %v", endpoint, probeErr)
+		return precheckStepWarning, "Unable to determine whether the source server supports Git LFS: " + probeErr.Error()
+	}
 }
 
 // FIXME: inject in the handler chain
